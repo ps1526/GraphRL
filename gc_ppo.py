@@ -9,6 +9,7 @@ from torch_geometric.data import Data
 from torch_geometric.utils import to_networkx, erdos_renyi_graph
 from torch_geometric.nn import GCNConv
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
 
 class GraphColoringEnv:
     def __init__(self, data, num_colors):
@@ -213,8 +214,12 @@ def train_ppo(env, policy, optimizer, device, num_episodes=3000, max_steps=None,
     """Train PPO policy on graph coloring env.
 
     Each episode: rollout -> scale rewards -> returns -> advantages -> multiple PPO updates (ppo_epochs).
+    Every num_episodes/5 episodes, runs a deterministic rollout and stores (episode, coloring, conflicts)
+    for later animation. Returns (policy, snapshots).
     """
     policy.to(device)
+    checkpoint_interval = max(1, num_episodes // 5)
+    snapshots = []  # list of (episode, coloring_tensor, conflicts)
 
     for episode in range(num_episodes):
         trajectory = rollout(env, policy, device, max_steps=max_steps)
@@ -235,7 +240,12 @@ def train_ppo(env, policy, optimizer, device, num_episodes=3000, max_steps=None,
             adv_max = advs.max().item()
             print(f"Ep {episode + 1}/{num_episodes}  reward={total_reward:.1f}  loss={loss:.4f}  entropy={mean_entropy:.4f}  adv_mean={adv_mean:.4f}  adv_max={adv_max:.4f}")
 
-    return policy
+        # Every num_episodes/5, run deterministic policy and store coloring for progression animation
+        if (episode + 1) % checkpoint_interval == 0 or episode == 0:
+            _ = rollout(env, policy, device, deterministic=True)
+            snapshots.append((episode + 1, env.coloring.clone().cpu(), count_conflicts(env)))
+
+    return policy, snapshots
 
 
 def make_synthetic_graph(n_nodes, edge_prob=0.3, seed=0):
@@ -271,6 +281,48 @@ def visualize_coloring(env, save_path=None, title="Graph coloring"):
         plt.tight_layout()
     plt.show()
 
+
+_PALETTE = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628", "#f781bf", "#999999", "#66c2a5", "#fc8d62"]
+
+
+def animate_coloring_progression(env, snapshots, save_path=None, interval=800, figsize=(6, 5)):
+    """Animate the progression of graph colorings over training checkpoints.
+
+    snapshots: list of (episode, coloring_tensor, conflicts) from train_ppo.
+    save_path: if set (e.g. 'progression.gif'), save the animation to file.
+    interval: milliseconds between frames.
+    """
+    if not snapshots:
+        print("No snapshots to animate.")
+        return
+    g = env.to_networkx()
+    pos = nx.spring_layout(g, seed=42)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    def get_node_colors(coloring):
+        return [_PALETTE[c % len(_PALETTE)] for c in coloring.tolist()]
+
+    def update(frame):
+        ax.clear()
+        ep, coloring, conflicts = snapshots[frame]
+        node_colors = get_node_colors(coloring)
+        nx.draw(g, pos, node_color=node_colors, with_labels=True, font_weight="bold", ax=ax)
+        ax.set_title(f"Episode {ep}  |  Conflicts: {conflicts}")
+        return ax,
+
+    anim = FuncAnimation(fig, update, frames=len(snapshots), interval=interval, blit=False, repeat=True)
+    plt.tight_layout()
+    if save_path:
+        path = save_path if save_path.endswith(".gif") else save_path + ".gif"
+        writer = PillowWriter(fps=1000 // interval)
+        anim.save(path, writer=writer)
+        print(f"Saved animation to {path}")
+    else:
+        plt.show()
+    return anim
+
+
 def main():
     # 1. Denser synthetic graph and env (more edges = stronger learning signal)
     n_nodes, num_colors = 10, 3
@@ -286,7 +338,7 @@ def main():
 
     # 3. Train: looser clip (epsilon=0.5), lower entropy so policy can specialize, multiple PPO epochs per trajectory
     print("Training PPO...")
-    train_ppo(
+    policy, snapshots = train_ppo(
         env, policy, optimizer, device,
         num_episodes=3000,
         gamma=0.99,
@@ -296,6 +348,7 @@ def main():
         entropy_coef=0.001,
         ppo_epochs=4,
     )
+    print(f"Stored {len(snapshots)} checkpoints for progression animation (every num_episodes/5).")
 
     # 4. Test: deterministic (greedy) and stochastic rollouts
     print("\nRunning deterministic rollout (greedy)...")
@@ -314,6 +367,10 @@ def main():
     _ = rollout(env, policy, device, deterministic=True)
     conflicts = count_conflicts(env)
     visualize_coloring(env, save_path="gc_result.png", title=f"Graph coloring (conflicts={conflicts})")
+
+    # 6. Run progression animation (policy improving over training)
+    print("\nProgression animation (checkpoints every num_episodes/5)...")
+    animate_coloring_progression(env, snapshots, save_path="gc_progression.gif", interval=800)
 
 
 if __name__ == "__main__":
